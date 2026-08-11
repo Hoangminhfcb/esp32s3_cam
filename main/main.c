@@ -12,11 +12,11 @@
 #include "sensor.h"
 #include "driver/gpio.h"
 
-static const char *TAG = "ON_DEMAND_CAM";
+static const char *TAG = "ESP32S3_CAM_STREAM";
 
 // --- WI-FI CONFIG ---
-#define WIFI_SSID      "Kien"
-#define WIFI_PASS      "hoithangtuan"
+#define WIFI_SSID       "Kien"
+#define WIFI_PASS       "hoithangtuan"
 
 // --- PINOUT OV5640 ---
 #define CAM_PIN_PWDN    38
@@ -36,7 +36,14 @@ static const char *TAG = "ON_DEMAND_CAM";
 #define CAM_PIN_D6      17
 #define CAM_PIN_D7      16
 
+// Cấu hình Header chuẩn cho luồng MJPEG Stream
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
 static SemaphoreHandle_t cam_mutex = NULL;
+static bool is_camera_initialized = false;
 
 static camera_config_t camera_config = {
     .pin_pwdn = CAM_PIN_PWDN,
@@ -56,150 +63,171 @@ static camera_config_t camera_config = {
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
     
-    .xclk_freq_hz = 10000000,
+    .xclk_freq_hz = 20000000,           // Tăng lên 20MHz để FPS mượt hơn
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_VGA,    // 640x480
-    .jpeg_quality = 12,
-    .fb_count = 1,
-    .grab_mode = CAMERA_GRAB_WHEN_EMPTY
+    .frame_size = FRAMESIZE_VGA,        // 640x480 (Có thể đổi sang FRAMESIZE_QVGA 320x240 để tăng FPS)
+    .jpeg_quality = 12,                 // 1-63: Số nhỏ hơn = chất lượng cao hơn nhưng tốn dung lượng
+    .fb_count = 2,                      // Sử dụng Double Buffer để tăng tốc độ truyền khung hình
+    .grab_mode = CAMERA_GRAB_LATEST
 };
 
 // --- HÀM TẮT CAMERA TRIỆT ĐỂ (HẠ NHIỆT) ---
 void ov5640_power_down(void)
 {
-    // 1. Gửi lệnh Software Standby tới OV5640 qua thanh ghi 0x3008 nếu camera đang chạy
+    if (!is_camera_initialized) return;
+
     sensor_t *s = esp_camera_sensor_get();
     if (s != NULL && s->id.PID == OV5640_PID) {
-        s->set_reg(s, 0x3008, 0xFF, 0x42);
+        s->set_reg(s, 0x3008, 0xFF, 0x42); // Software Standby
     }
 
-    // 2. Tắt phần mềm driver trong ESP-IDF
     esp_camera_deinit();
 
-    // 3. Ngắt hoàn toàn xung XCLK (GPIO 15)
     gpio_reset_pin(CAM_PIN_XCLK);
     gpio_set_direction(CAM_PIN_XCLK, GPIO_MODE_INPUT);
 
-    // 4. Ép PWDN (GPIO 38) lên HIGH (1) để cắt nguồn phần cứng cảm biến
     gpio_reset_pin(CAM_PIN_PWDN);
     gpio_set_direction(CAM_PIN_PWDN, GPIO_MODE_OUTPUT);
-    gpio_set_level(CAM_PIN_PWDN, 1);
+    gpio_set_level(CAM_PIN_PWDN, 1); // Cắt nguồn phần cứng
 
-    // 5. Ngắt bus I2C để tránh rò dòng
     gpio_reset_pin(CAM_PIN_SIOD);
     gpio_reset_pin(CAM_PIN_SIOC);
 
-    ESP_LOGI(TAG, "Camera đã được ngắt hoàn toàn. Trạng thái: NGHỈ MÁT.");
+    is_camera_initialized = false;
+    ESP_LOGI(TAG, "Camera đã dừng Stream và được ngắt nguồn hoàn toàn.");
 }
 
-// --- GIAO DIỆN HTML WEB ---
+// --- HÀM BẬT CAMERA ---
+esp_err_t ov5640_power_up(void)
+{
+    if (is_camera_initialized) return ESP_OK;
+
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Khởi tạo Camera thất bại: 0x%x", err);
+        ov5640_power_down();
+        return err;
+    }
+
+    // Bỏ qua các khung hình ban đầu để AEC/AGC cân bằng ánh sáng
+    for (int i = 0; i < 3; i++) {
+        camera_fb_t *dummy_fb = esp_camera_fb_get();
+        if (dummy_fb) {
+            esp_camera_fb_return(dummy_fb);
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+
+    is_camera_initialized = true;
+    ESP_LOGI(TAG, "Camera đã được bật thành công.");
+    return ESP_OK;
+}
+
+// --- GIAO DIỆN WEB ---
 static const char INDEX_HTML[] = 
     "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
     "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-    "<title>ESP32-S3 Cool Camera</title>"
+    "<title>ESP32-S3 Video Stream</title>"
     "<style>"
-    "  body { font-family: Arial; text-align: center; margin-top: 30px; background: #181818; color: #fff; }"
-    "  img { max-width: 90%; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.6); margin-top: 15px; min-height: 200px; background: #2a2a2a; }"
-    "  button { padding: 14px 28px; font-size: 16px; font-weight: bold; background: #28a745; color: white; border: none; border-radius: 6px; cursor: pointer; transition: 0.2s; }"
-    "  button:hover { background: #218838; }"
-    "  button:disabled { background: #6c757d; cursor: not-allowed; }"
-    "  #status { margin-top: 10px; color: #aaa; font-style: italic; }"
+    "  body { font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 20px; background: #121212; color: #fff; }"
+    "  h2 { color: #00e676; margin-bottom: 10px; }"
+    "  .container { display: inline-block; background: #1e1e1e; padding: 15px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.8); }"
+    "  img { max-width: 100%; height: auto; border-radius: 8px; background: #000; min-width: 320px; min-height: 240px; }"
+    "  .status { margin-top: 12px; font-size: 14px; color: #b0bec5; }"
     "</style></head><body>"
-    "<h2>ESP32-S3 On-Demand Camera Viewer</h2>"
-    "<button id='btn' onclick='takePhoto()'>Chụp Ảnh (Kích hoạt Cam)</button>"
-    "<div id='status'>Trạng thái: Camera đang TẮT (Mát)</div>"
-    "<br><img id='photo' src='' alt='Bấm Chụp Ảnh để kích hoạt camera'><script>"
-    "function takePhoto() {"
-    "  var btn = document.getElementById('btn');"
-    "  var status = document.getElementById('status');"
-    "  btn.disabled = true;"
-    "  status.innerText = 'Đang bật Camera & Cân bằng ánh sáng...';"
-    "  var img = document.getElementById('photo');"
-    "  img.src = '/capture?t=' + new Date().getTime();"
-    "  img.onload = function() {"
-    "    btn.disabled = false;"
-    "    status.innerText = 'Đã chụp xong! Camera đã TẮT trở lại.';"
-    "  };"
-    "  img.onerror = function() {"
-    "    btn.disabled = false;"
-    "    status.innerText = 'Lỗi chụp ảnh!';"
-    "  };"
-    "}"
-    "</script></body></html>";
+    "  <div class='container'>"
+    "    <h2>ESP32-S3 Real-Time Video</h2>"
+    "    <img src='/stream' alt='Video Stream Unavailable'>"
+    "    <div class='status'>Đang phát video trực tiếp. Đóng tab để tắt Camera.</div>"
+    "  </div>"
+    "</body></html>";
 
 static esp_err_t index_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
-// --- HTTP HANDLER: BẬT CAM -> CHỤP -> TẮT CAM ---
-static esp_err_t capture_handler(httpd_req_t *req) {
-    // Tránh việc bấm chụp dồn dập làm chập luồng
-    if (xSemaphoreTake(cam_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+// --- HTTP HANDLER: PHÁT VIDEO STREAM (MJPEG) ---
+static esp_err_t stream_handler(httpd_req_t *req) {
+    camera_fb_t *fb = NULL;
+    esp_err_t res = ESP_OK;
+    char part_buf[64];
+
+    if (xSemaphoreTake(cam_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Nhận yêu cầu chụp: Đang BẬT Camera...");
-
-    // 1. Kích hoạt/Khởi tạo lại Camera
-    esp_err_t err = esp_camera_init(&camera_config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Bật Camera thất bại: 0x%x", err);
-        ov5640_power_down();
+    // 1. Kích hoạt camera khi có Client truy cập link Stream
+    if (ov5640_power_up() != ESP_OK) {
         xSemaphoreGive(cam_mutex);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
-    // 2. Bỏ qua 2 khung hình đầu tiên để thuật toán Phơi sáng tự động (AEC) của OV5640 kịp cân bằng
-    for (int i = 0; i < 2; i++) {
-        camera_fb_t *dummy_fb = esp_camera_fb_get();
-        if (dummy_fb) {
-            esp_camera_fb_return(dummy_fb);
+    // 2. Thiết lập Header dạng multipart cho Client
+    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+    if (res != ESP_OK) {
+        xSemaphoreGive(cam_mutex);
+        return res;
+    }
+
+    ESP_LOGI(TAG, "Bắt đầu truyền Video Stream...");
+
+    // 3. Vòng lặp gửi khung hình liên tục (Tạo Video)
+    while (true) {
+        fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGE(TAG, "Lỗi lấy khung hình!");
+            res = ESP_FAIL;
+            break;
         }
-        vTaskDelay(pdMS_TO_TICKS(40));
+
+        // Gửi Boundary
+        res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+        if (res != ESP_OK) {
+            esp_camera_fb_return(fb);
+            break;
+        }
+
+        // Gửi Header từng khung ảnh JPEG
+        size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, fb->len);
+        res = httpd_resp_send_chunk(req, part_buf, hlen);
+        if (res != ESP_OK) {
+            esp_camera_fb_return(fb);
+            break;
+        }
+
+        // Gửi dữ liệu ảnh JPEG
+        res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+        esp_camera_fb_return(fb);
+        if (res != ESP_OK) {
+            break; // Ngắt vòng lặp khi Người dùng đóng trình duyệt / mất kết nối
+        }
     }
 
-    // 3. Chụp bức ảnh chính thức
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-        ESP_LOGE(TAG, "Không lấy được khung hình!");
-        ov5640_power_down();
-        xSemaphoreGive(cam_mutex);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    // 4. Gửi mảng ảnh JPEG về cho Trình duyệt
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-
-    // Trả lại buffer
-    esp_camera_fb_return(fb);
-
-    // 5. TẮT CẢM BIẾN LẬP TỨC ĐỂ TRÁNH TỎA NHIỆT
+    // 4. Ngắt kết nối & Tắt Camera để hạ nhiệt
+    ESP_LOGI(TAG, "Client đã ngắt kết nối Stream.");
     ov5640_power_down();
-
     xSemaphoreGive(cam_mutex);
+
     return res;
 }
 
 static httpd_handle_t start_webserver(void) {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
     config.stack_size = 8192;
 
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t index_uri = { .uri = "/", .method = HTTP_GET, .handler = index_handler };
         httpd_register_uri_handler(server, &index_uri);
 
-        httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler };
-        httpd_register_uri_handler(server, &capture_uri);
+        httpd_uri_t stream_uri = { .uri = "/stream", .method = HTTP_GET, .handler = stream_handler };
+        httpd_register_uri_handler(server, &stream_uri);
     }
     return server;
 }
@@ -212,7 +240,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "==========================================");
-        ESP_LOGI(TAG, "Đã kết nối Wi-Fi! IP: http://" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Wi-Fi Connected! Xem Video tại: http://" IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "==========================================");
         start_webserver();
     }
@@ -241,10 +269,8 @@ void wifi_init_sta(void) {
 }
 
 void app_main(void) {
-    // Tạo Mutex chống xung đột bộ nhớ
     cam_mutex = xSemaphoreCreateMutex();
 
-    // 1. Khởi tạo Flash NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -252,9 +278,9 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 2. Ép Camera ngắt nguồn ngay khi vừa bật nguồn ESP32-S3 (Để đảm bảo mát ngay từ đầu)
+    // Tắt camera ngay khi khởi động
     ov5640_power_down();
 
-    // 3. Khởi chạy Wi-Fi
+    // Khởi chạy Wi-Fi
     wifi_init_sta();
 }

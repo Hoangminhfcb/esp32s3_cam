@@ -4,7 +4,6 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.portWin": "COM4",
   "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.5.4/",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -15,5 +14,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\Zanis\\Documents\\Embeded\\esp32s3_cam\\build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.port": "COM4"
 }
